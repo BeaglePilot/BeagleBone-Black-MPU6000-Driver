@@ -6,7 +6,9 @@
 #include <linux/device.h>
 #include <linux/sched.h>
 #include <linux/mod_devicetable.h>
-
+#include <linux/fs.h>
+#include <linux/device.h>
+#include <linux/types.h>
 #include <linux/spi/spi.h>
 #include <linux/spi/eeprom.h>
 #include <linux/of.h>
@@ -107,6 +109,8 @@ static int imu_probe(struct spi_device *spi) {
 	MPU6000_data.gyro_range_scale = (0.0174532 / 16.4);//1.0f / (32768.0f * (2000.0f / 180.0f) * M_PI_F);
 	MPU6000_data.gyro_range_rad_s = (2000.0f / 180.0f) * M_PI_F;
 
+	MPU6000_data.product = read_reg(spi, MPUREG_PRODUCT_ID);
+
 	// product-specific scaling
 	switch (MPU6000_data.product) {
 	case MPU6000ES_REV_C4:
@@ -150,6 +154,8 @@ static int imu_probe(struct spi_device *spi) {
 	// Oscillator set
 	// write_reg(MPUREG_PWR_MGMT_1,MPU_CLK_SEL_PLLGYROZ);
 	//usleep(1000);
+
+	return 0;
 }
 
 int write_reg(struct spi_device *spi, uint8_t reg, uint8_t val) {
@@ -193,11 +199,27 @@ set_dlpf_filter(struct spi_device *spi, uint16_t frequency_hz)
 	write_reg(spi, MPUREG_CONFIG, filter);
 }
 
-
 ssize_t read_reg(struct spi_device *spi, uint8_t reg) {
     return spi_w8r8(spi,reg|0x80);
 }
 
+static ssize_t mpu_read(struct file * file_ptr, char __user * buffer, size_t length, loff_t * offset) {
+	return 0;
+}
+
+static ssize_t mpu_open(struct inode * inode, struct file * file_ptr) {
+	return 0;
+}
+
+static ssize_t mpu_close(struct inode * inode, struct file * file_ptr) {
+	return 0;
+}
+
+static struct file_operations fops = {
+	.read = mpu_read,
+	.open = mpu_open,
+	.release = mpu_close
+};
 
 static struct spi_driver imu_driver = {
 	.driver = {
@@ -218,12 +240,34 @@ void set_sample_rate(struct spi_device *spi, uint16_t desired_sample_rate_hz)
   MPU6000_data.sample_rate = 1000 / div;
 }
 
-module_spi_driver(imu_driver);
+static int mpu_init(void) {
 
-MODULE_DESCRIPTION("Driver for IMU");
+	int mpu_major;
+	int retval = 0;
+
+	mpu_major = register_chrdev(0, "mpu_6000", &fops);
+		if (mpu_major < 0) {
+			printk(KERN_ERR "failed to register device: error %d\n", mpu_major);
+			retval = mpu_major;
+			goto init_failed;
+		}
+
+	spi_register_driver(&imu_driver);
+
+ init_failed:
+ return retval;
+}
+
+module_init(mpu_init);
+
+static void exit_mpu(void)
+{
+	spi_unregister_driver(&imu_driver);
+}
+
+module_exit(exit_mpu);
+
+MODULE_DESCRIPTION("Driver for MPU 6000");
 MODULE_AUTHOR("Jimmy Johnson");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("imu");
-
-//module_init(hello_init);
-//module_exit(hello_exit);
