@@ -4,6 +4,7 @@
  *  Created on: May 21, 2014
  *      Author: jimmy
  */
+#include <linux/types.h>
 
 #ifndef MPU6000_H_
 #define MPU6000_H_
