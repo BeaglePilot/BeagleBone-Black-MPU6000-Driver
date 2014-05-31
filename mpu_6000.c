@@ -17,12 +17,34 @@
 #include <linux/sched.h>  // for task_struct
 #include <linux/time.h>   // for using jiffies
 #include <linux/timer.h>
+#include <linux/kfifo.h>
+#include <linux/mutex.h>
 
 #include "mpu_6000.h"
 #define M_PI_F			3.14159265358979323846f
 #define CLASS_NAME "mpu_6000"
 #define DEVICE_NAME "device"
 MODULE_LICENSE("Dual BSD/GPL");
+/* lock for procfs read access */
+static DEFINE_MUTEX(read_lock);
+static DEFINE_MUTEX(user_space_command_lock);
+
+typedef struct MPUReport {
+	uint8_t		status;
+	int16_t		accel_x;
+	int16_t		accel_y;
+	int16_t		accel_z;
+	int16_t		temp;
+	int16_t		gyro_x;
+	int16_t		gyro_y;
+	int16_t		gyro_z;
+} MPUReport;
+
+static MPUReport mpu_report;
+
+#define FIFO_SIZE	32
+//static struct kfifo mpu_reports;
+static DECLARE_KFIFO(mpu_reports, MPUReport, 32);
 
 // measurement thread
 static struct task_struct *mpu_sample_thread;
@@ -35,7 +57,7 @@ static int write_reg(struct spi_device *spi, uint8_t reg, uint8_t val);
 static ssize_t read_reg(struct spi_device *spi, uint8_t reg);
 static void set_sample_rate(struct spi_device *spi, uint16_t desired_sample_rate_hz);
 static void set_dlpf_filter(struct spi_device *spi, uint16_t frequency_hz);
-static ssize_t read_multiple(struct spi_device *spi, uint8_t reg, uint8_t * rx_buf, size_t length);
+static ssize_t read_multiple_regs(struct spi_device *spi, uint8_t reg, uint8_t * rx_buf, size_t length);
 static int sample_mpu(void * data);
 
 /**
@@ -93,17 +115,48 @@ struct {
 
 } MPU6000_data = { .sample_rate = 1000, .product = 0 };
 
-static struct of_device_id imu_of_match[] = { { .compatible = "ti,imu", }, { } };
+static struct of_device_id imu_of_match[] = {
+		{ .compatible = "ti,imu", },
+		{ }
+};
 
 MODULE_DEVICE_TABLE(of, imu_of_match);
 
 static int imu_remove(struct spi_device *spi) {
-	printk("<1> Goodbye world probe!\n");
+	printk("Module removed\n");
 	return 0;
 }
 
+static ssize_t sys_store_sample_rate(struct device* dev,
+								   struct device_attribute* attr,
+								   const char* buf,
+								   size_t count)
+{
+	unsigned int sample_rate;
+	int status;
+
+	status = kstrtouint(buf, 10, &sample_rate);
+
+	if(status < 0) {
+		return status;
+	}
+
+	set_sample_rate((struct spi_device *) dev->platform_data, sample_rate);
+
+	printk(KERN_INFO "Sample rate set to %d\n", sample_rate);
+
+	return count;
+}
+
+static DEVICE_ATTR(sample_rate, S_IWUSR, NULL, sys_store_sample_rate);
+
 static int imu_probe(struct spi_device *spi) {
+
 	int status = 0;
+
+	// Save spi pointer info
+
+	spi->dev.platform_data = spi;
 
 	//reset
 	status = write_reg(spi, MPUREG_PWR_MGMT_1, BIT_H_RESET);
@@ -191,8 +244,12 @@ static int imu_probe(struct spi_device *spi) {
 		printk(KERN_INFO "New thread created");
 		wake_up_process(mpu_sample_thread);
 	}
+
+	status = device_create_file(&spi->dev, &dev_attr_sample_rate);
+
 	return 0;
 }
+
 
 int write_reg(struct spi_device *spi, uint8_t reg, uint8_t val) {
 
@@ -230,6 +287,7 @@ void set_dlpf_filter(struct spi_device *spi, uint16_t frequency_hz) {
 	} else {
 		filter = BITS_DLPF_CFG_2100HZ_NOLPF;
 	}
+
 	write_reg(spi, MPUREG_CONFIG, filter);
 }
 
@@ -237,16 +295,25 @@ ssize_t read_reg(struct spi_device *spi, uint8_t reg) {
 	return spi_w8r8(spi, reg | 0x80);
 }
 
-static ssize_t read_multiple(struct spi_device *spi, uint8_t reg, uint8_t * rx_buf, size_t length) {
+static ssize_t read_multiple_regs(struct spi_device *spi, uint8_t reg, uint8_t * rx_buf, size_t length) {
 
 	reg = reg | 0x80;
 
 	return spi_write_then_read(spi, &reg, sizeof(uint8_t), rx_buf, length);
 }
 
-static ssize_t mpu_read(struct file * file_ptr, char __user * buffer, size_t length, loff_t * offset) {
-	printk("read mpu 6000\n");
-	return 0;
+static ssize_t mpu_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) {
+	int ret;
+	unsigned int copied;
+
+	if (mutex_lock_interruptible(&read_lock))
+		return -ERESTARTSYS;
+
+	ret = kfifo_to_user(&mpu_reports, buf, count, &copied);
+
+	mutex_unlock(&read_lock);
+
+	return ret ? ret : copied;
 }
 
 static ssize_t mpu_open(struct inode * inode, struct file * file_ptr) {
@@ -289,6 +356,10 @@ static int mpu_init(void) {
 	int mpu_major;
 	int retval = 0;
 
+	INIT_KFIFO(mpu_reports);
+	mutex_init(&user_space_command_lock);
+	mutex_lock(&user_space_command_lock);
+
 	retval = spi_register_driver(&imu_driver);
 
 	if (retval < 0) {
@@ -310,8 +381,6 @@ static int mpu_init(void) {
 		goto init_failed;
 	}
 
-	/* With a class, the easiest way to instantiate a device is to call device_create() */
-
 	mpu_device = device_create(mpu_class, NULL, MKDEV(mpu_major, 0), NULL, CLASS_NAME "_" DEVICE_NAME);
 	if (IS_ERR(mpu_device)) {
 		printk(KERN_ERR "failed to create device '%s_%s'\n", CLASS_NAME,
@@ -324,35 +393,26 @@ static int mpu_init(void) {
 
 	init_failed:
 
-	spi_unregister_device(&imu_driver);
+	//spi_unregister_device(spi);
 
 	return retval;
 }
 
 static int sample_mpu(void * data) {
 
-	struct MPUReport {
-		uint8_t		status;
-		uint8_t		accel_x[2];
-		uint8_t		accel_y[2];
-		uint8_t		accel_z[2];
-		uint8_t		temp[2];
-		uint8_t		gyro_x[2];
-		uint8_t		gyro_y[2];
-		uint8_t		gyro_z[2];
-	} mpu_report;
-
 	struct spi_device *spi = (struct spi_device *) data;
 
-
-
 	while(1) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		printk(KERN_INFO "accel_x %d", (uint16_t) mpu_report.accel_x);
-		// change this to be controlled by mpu intterupt
-		schedule_timeout (HZ/2);
 
-		read_multiple(spi, MPUREG_INT_STATUS, ((uint8_t *)&mpu_report), sizeof(mpu_report));
+		set_current_state(TASK_INTERRUPTIBLE);
+
+		// change this to be controlled by mpu interrupt
+		schedule_timeout (HZ/100);
+
+		// change this to be a dma transfer
+		read_multiple_regs(spi, MPUREG_INT_STATUS, ((uint8_t *)&mpu_report), sizeof(mpu_report));
+		kfifo_put(&mpu_reports, &mpu_report);
+		//do_gettimeofday()
 	}
 
 	return 0;
