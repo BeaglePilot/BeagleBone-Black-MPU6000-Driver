@@ -1,9 +1,3 @@
-/*
- * MPU6000.h
- *
- *  Created on: May 21, 2014
- *      Author: jimmy
- */
 #include <linux/types.h>
 
 #ifndef MPU6000_H_
@@ -93,7 +87,5 @@
 #define MPU6000_GYRO_DEFAULT_DRIVER_FILTER_FREQ		30
 
 #define MPU6000_DEFAULT_ONCHIP_FILTER_FREQ			42
-
-#define MPU6000_ONE_G					9.80665f
 
 #endif /* MPU6000_H_ */

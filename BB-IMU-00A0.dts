@@ -34,7 +34,7 @@
 				#size-cells = <0x0>;
 				compatible = "imu";
 				reg = <0x0>;
-				spi-max-frequency = <900000>;
+				spi-max-frequency = <500000>;
 				spi-cpha;
 				spi-cpol;
 			};			

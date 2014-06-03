@@ -1,55 +1,49 @@
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/module.h>
-#include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/sched.h>
 #include <linux/mod_devicetable.h>
 #include <linux/fs.h>
-#include <linux/device.h>
 #include <linux/types.h>
 #include <linux/spi/spi.h>
-#include <linux/spi/eeprom.h>
 #include <linux/of.h>
-#include <linux/delay.h>
 #include <linux/kthread.h>
-#include <linux/sched.h>  // for task_struct
-#include <linux/time.h>   // for using jiffies
-#include <linux/timer.h>
+#include <linux/time.h>
 #include <linux/kfifo.h>
 #include <linux/mutex.h>
 
 #include "mpu_6000.h"
-#define M_PI_F			3.14159265358979323846f
-#define CLASS_NAME "mpu_6000"
-#define DEVICE_NAME "device"
-MODULE_LICENSE("Dual BSD/GPL");
-/* lock for procfs read access */
-static DEFINE_MUTEX(read_lock);
-static DEFINE_MUTEX(user_space_command_lock);
+
+#define CLASS_NAME "mpu6000"
+
+#define swap_uint16_t(x)((x & 0xff) << 8) | ((x & 0xff00) >> 8)
 
 typedef struct MPUReport {
-	uint8_t		status;
-	int16_t		accel_x;
-	int16_t		accel_y;
-	int16_t		accel_z;
-	int16_t		temp;
-	int16_t		gyro_x;
-	int16_t		gyro_y;
-	int16_t		gyro_z;
-} MPUReport;
+	struct timeval timestamp;
+	unsigned long error_count;
 
-static MPUReport mpu_report;
+	int16_t gyro_x_raw;
+	int16_t gyro_y_raw;
+	int16_t gyro_z_raw;
 
-#define FIFO_SIZE	32
-//static struct kfifo mpu_reports;
-static DECLARE_KFIFO(mpu_reports, MPUReport, 32);
+	int16_t accel_x_raw;
+	int16_t accel_y_raw;
+	int16_t accel_z_raw;
+	int16_t temperature_raw;
+}MPUReport;
 
-// measurement thread
+
+MODULE_LICENSE("Dual BSD/GPL");
+
+static DEFINE_MUTEX(read_lock);
+
+#define FIFO_SIZE 32
+
+static DECLARE_KFIFO(mpu_reports, MPUReport, FIFO_SIZE);
+
 static struct task_struct *mpu_sample_thread;
 
-/* Device variables */
 static struct class* mpu_class = NULL;
 static struct device* mpu_device = NULL;
 
@@ -60,59 +54,9 @@ static void set_dlpf_filter(struct spi_device *spi, uint16_t frequency_hz);
 static ssize_t read_multiple_regs(struct spi_device *spi, uint8_t reg, uint8_t * rx_buf, size_t length);
 static int sample_mpu(void * data);
 
-/**
- * accel report structure.  Reads from the device must be in multiples of this
- * structure.
- */
-struct accel_report {
-	unsigned long timestamp;
-	unsigned long error_count;
-	float x;		/**< acceleration in the NED X board axis in m/s^2 */
-	float y;		/**< acceleration in the NED Y board axis in m/s^2 */
-	float z;		/**< acceleration in the NED Z board axis in m/s^2 */
-	float temperature;	/**< temperature in degrees celsius */
-	float range_m_s2;	/**< range in m/s^2 (+- this value) */
-	float scaling;
-
-	int16_t x_raw;
-	int16_t y_raw;
-	int16_t z_raw;
-	int16_t temperature_raw;
-};
-
-
-/** gyro scaling factors; Vout = (Vin * Vscale) + Voffset */
-
-struct gyro_scale {
-	float x_offset;
-	float x_scale;
-	float y_offset;
-	float y_scale;
-	float z_offset;
-	float z_scale;
-} gyro_scale = { 0, 1.0f, 0, 1.0f, 0, 1.0f };
-
-/** accel scaling factors; Vout = Vscale * (Vin + Voffset) */
-
-struct accel_scale {
-	float x_offset;
-	float x_scale;
-	float y_offset;
-	float y_scale;
-	float z_offset;
-	float z_scale;
-} accel_scale = { 0, 1.0f, 0, 1.0f, 0, 1.0f };
-
 struct {
 	unsigned int sample_rate;
 	uint8_t product;
-	float gyro_range_scale;
-	float gyro_range_rad_s;
-
-	struct accel_scale _accel_scale;
-	float accel_range_scale;
-	float accel_range_m_s2;
-
 } MPU6000_data = { .sample_rate = 1000, .product = 0 };
 
 static struct of_device_id imu_of_match[] = {
@@ -130,8 +74,7 @@ static int imu_remove(struct spi_device *spi) {
 static ssize_t sys_store_sample_rate(struct device* dev,
 								   struct device_attribute* attr,
 								   const char* buf,
-								   size_t count)
-{
+								   size_t count)  {
 	unsigned int sample_rate;
 	int status;
 
@@ -143,7 +86,7 @@ static ssize_t sys_store_sample_rate(struct device* dev,
 
 	set_sample_rate((struct spi_device *) dev->platform_data, sample_rate);
 
-	printk(KERN_INFO "Sample rate set to %d\n", sample_rate);
+	printk(KERN_INFO "MPU 6000 Sample rate set to %d\n", sample_rate);
 
 	return count;
 }
@@ -160,37 +103,28 @@ static int imu_probe(struct spi_device *spi) {
 
 	//reset
 	status = write_reg(spi, MPUREG_PWR_MGMT_1, BIT_H_RESET);
-	mdelay(100);
+	mdelay(200);
 
 	//sleep mode off
 	status = write_reg(spi, MPUREG_PWR_MGMT_1, 0x00); //clear SLEEP bit
-	mdelay(100);
+	mdelay(200);
 
 	//disable I2C
 	status = write_reg(spi, MPUREG_USER_CTRL, BIT_I2C_IF_DIS); //set bit I2C_IF_DIS to 1
-	mdelay(100);
+	mdelay(200);
 
 	// SAMPLE RATE
 	set_sample_rate(spi, MPU6000_data.sample_rate);
-	mdelay(100);
+	mdelay(200);
 
 	// FS & DLPF   FS=2000 deg/s, DLPF = 20Hz (low pass filter)
-	// was 90 Hz, but this ruins quality and does not improve the
-	// system response
+
 	set_dlpf_filter(spi, MPU6000_DEFAULT_ONCHIP_FILTER_FREQ);
-	mdelay(100);
+	mdelay(200);
 
 	// Gyro scale 2000 deg/s ()
 	write_reg(spi, MPUREG_GYRO_CONFIG, BITS_FS_2000DPS);
-	mdelay(100);
-
-	// correct gyro scale factors
-	// scale to rad/s in SI units
-	// 2000 deg/s = (2000/180)*PI = 34.906585 rad/s
-	// scaling factor:
-	// 1/(2^15)*(2000/180)*PI
-	MPU6000_data.gyro_range_scale = (0.0174532 / 16.4);	//1.0f / (32768.0f * (2000.0f / 180.0f) * M_PI_F);
-	MPU6000_data.gyro_range_rad_s = (2000.0f / 180.0f) * M_PI_F;
+	mdelay(200);
 
 	MPU6000_data.product = read_reg(spi, MPUREG_PRODUCT_ID);
 
@@ -221,22 +155,13 @@ static int imu_probe(struct spi_device *spi) {
 		break;
 	}
 
-	// Correct accel scale factors of 4096 LSB/g
-	// scale to m/s^2 ( 1g = 9.81 m/s^2)
-	MPU6000_data.accel_range_scale = (MPU6000_ONE_G / 4096.0f);
-	MPU6000_data.accel_range_m_s2 = 8.0f * MPU6000_ONE_G;
-
-	mdelay(100);
+	mdelay(200);
 
 	// INT CFG => Interrupt on Data Ready
 	write_reg(spi, MPUREG_INT_ENABLE, BIT_RAW_RDY_EN);    // INT: Raw data ready
 	mdelay(100);
 	write_reg(spi, MPUREG_INT_PIN_CFG, BIT_INT_ANYRD_2CLEAR); // INT: Clear on any read
-	mdelay(100);
-
-	// Oscillator set
-	// write_reg(MPUREG_PWR_MGMT_1,MPU_CLK_SEL_PLLGYROZ);
-	//usleep(1000);
+	mdelay(300);
 
 	mpu_sample_thread = kthread_create(sample_mpu, spi, "mpu_sampling");
 
@@ -322,6 +247,7 @@ static ssize_t mpu_open(struct inode * inode, struct file * file_ptr) {
 }
 
 static ssize_t mpu_close(struct inode * inode, struct file * file_ptr) {
+	printk("Closed mpu 6000\n");
 	return 0;
 }
 
@@ -357,8 +283,6 @@ static int mpu_init(void) {
 	int retval = 0;
 
 	INIT_KFIFO(mpu_reports);
-	mutex_init(&user_space_command_lock);
-	mutex_lock(&user_space_command_lock);
 
 	retval = spi_register_driver(&imu_driver);
 
@@ -367,7 +291,7 @@ static int mpu_init(void) {
 		return retval;
 	}
 
-	mpu_major = register_chrdev(0, "mpu_6000", &fops);
+	mpu_major = register_chrdev(0, "imu", &fops);
 	if (mpu_major < 0) {
 		printk(KERN_ERR "failed to register device: error %d\n", mpu_major);
 		retval = mpu_major;
@@ -381,10 +305,9 @@ static int mpu_init(void) {
 		goto init_failed;
 	}
 
-	mpu_device = device_create(mpu_class, NULL, MKDEV(mpu_major, 0), NULL, CLASS_NAME "_" DEVICE_NAME);
+	mpu_device = device_create(mpu_class, NULL, MKDEV(mpu_major, 0), NULL, CLASS_NAME);
 	if (IS_ERR(mpu_device)) {
-		printk(KERN_ERR "failed to create device '%s_%s'\n", CLASS_NAME,
-				DEVICE_NAME);
+		printk(KERN_ERR "failed to create device '%s'\n", CLASS_NAME);
 		retval = PTR_ERR(mpu_device);
 		goto init_failed;
 	}
@@ -402,6 +325,21 @@ static int sample_mpu(void * data) {
 
 	struct spi_device *spi = (struct spi_device *) data;
 
+	MPUReport		mpu_report;
+
+#pragma pack(push, 1)
+	struct mpu_report {
+		uint8_t		status;
+		int16_t		gyro_x;
+		int16_t		gyro_y;
+		int16_t		gyro_z;
+		int16_t		temp;
+		int16_t		accel_x;
+		int16_t		accel_y;
+		int16_t		accel_z;
+	} mpu_raw_report = {0};
+#pragma pack(pop)
+
 	while(1) {
 
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -410,9 +348,23 @@ static int sample_mpu(void * data) {
 		schedule_timeout (HZ/100);
 
 		// change this to be a dma transfer
-		read_multiple_regs(spi, MPUREG_INT_STATUS, ((uint8_t *)&mpu_report), sizeof(mpu_report));
+		read_multiple_regs(spi, MPUREG_INT_STATUS, ((uint8_t *)&mpu_raw_report), sizeof(mpu_raw_report));
+
+		do_gettimeofday(&mpu_report.timestamp);
+
+		mpu_report.error_count = 0; // not reported
+
+		mpu_report.accel_x_raw = swap_uint16_t(mpu_raw_report.accel_x);
+		mpu_report.accel_y_raw = swap_uint16_t(mpu_raw_report.accel_y);
+		mpu_report.accel_z_raw = swap_uint16_t(mpu_raw_report.accel_z);
+
+		mpu_report.temperature_raw = swap_uint16_t(mpu_raw_report.temp);
+
+		mpu_report.gyro_x_raw = swap_uint16_t(mpu_raw_report.gyro_x);
+		mpu_report.gyro_y_raw = swap_uint16_t(mpu_raw_report.gyro_y);
+		mpu_report.gyro_z_raw = swap_uint16_t(mpu_raw_report.gyro_z);
+
 		kfifo_put(&mpu_reports, &mpu_report);
-		//do_gettimeofday()
 	}
 
 	return 0;
