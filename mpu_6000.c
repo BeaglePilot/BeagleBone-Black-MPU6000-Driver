@@ -103,28 +103,28 @@ static int imu_probe(struct spi_device *spi) {
 
 	//reset
 	status = write_reg(spi, MPUREG_PWR_MGMT_1, BIT_H_RESET);
-	mdelay(200);
+	mdelay(100);
 
 	//sleep mode off
 	status = write_reg(spi, MPUREG_PWR_MGMT_1, 0x00); //clear SLEEP bit
-	mdelay(200);
+	mdelay(100);
 
 	//disable I2C
 	status = write_reg(spi, MPUREG_USER_CTRL, BIT_I2C_IF_DIS); //set bit I2C_IF_DIS to 1
-	mdelay(200);
+	mdelay(100);
 
 	// SAMPLE RATE
 	set_sample_rate(spi, MPU6000_data.sample_rate);
-	mdelay(200);
+	mdelay(100);
 
 	// FS & DLPF   FS=2000 deg/s, DLPF = 20Hz (low pass filter)
 
 	set_dlpf_filter(spi, MPU6000_DEFAULT_ONCHIP_FILTER_FREQ);
-	mdelay(200);
+	mdelay(100);
 
 	// Gyro scale 2000 deg/s ()
 	write_reg(spi, MPUREG_GYRO_CONFIG, BITS_FS_2000DPS);
-	mdelay(200);
+	mdelay(100);
 
 	MPU6000_data.product = read_reg(spi, MPUREG_PRODUCT_ID);
 
@@ -325,7 +325,8 @@ static int sample_mpu(void * data) {
 
 	struct spi_device *spi = (struct spi_device *) data;
 
-	MPUReport		mpu_report;
+	MPUReport mpu_report;
+	int result;
 
 #pragma pack(push, 1)
 	struct mpu_report {
@@ -347,12 +348,17 @@ static int sample_mpu(void * data) {
 		// change this to be controlled by mpu interrupt
 		schedule_timeout (HZ/100);
 
+		// pull out old data to make room for new read
+		// if needed and throw it out
+
+		if(kfifo_is_full(&mpu_reports)) {
+			result = kfifo_get(&mpu_reports, &mpu_report);
+		}
+
 		// change this to be a dma transfer
 		read_multiple_regs(spi, MPUREG_INT_STATUS, ((uint8_t *)&mpu_raw_report), sizeof(mpu_raw_report));
 
 		do_gettimeofday(&mpu_report.timestamp);
-
-		mpu_report.error_count = 0; // not reported
 
 		mpu_report.accel_x_raw = swap_uint16_t(mpu_raw_report.accel_x);
 		mpu_report.accel_y_raw = swap_uint16_t(mpu_raw_report.accel_y);
