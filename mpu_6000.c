@@ -47,6 +47,7 @@ static struct task_struct *mpu_sample_thread;
 static struct class* mpu_class = NULL;
 static struct device* mpu_device = NULL;
 
+static void exit_mpu(void);
 static int write_reg(struct spi_device *spi, uint8_t reg, uint8_t val);
 static ssize_t read_reg(struct spi_device *spi, uint8_t reg);
 static void set_sample_rate(struct spi_device *spi, uint16_t desired_sample_rate_hz);
@@ -59,14 +60,14 @@ struct {
 	uint8_t product;
 } MPU6000_data = { .sample_rate = 1000, .product = 0 };
 
-static struct of_device_id imu_of_match[] = {
-		{ .compatible = "ti,imu", },
+static struct of_device_id mpu_of_match[] = {
+		{ .compatible = "mpu6000", },
 		{ }
 };
 
-MODULE_DEVICE_TABLE(of, imu_of_match);
+MODULE_DEVICE_TABLE(of, mpu_of_match);
 
-static int imu_remove(struct spi_device *spi) {
+static int mpu_remove(struct spi_device *spi) {
 	printk("Module removed\n");
 	return 0;
 }
@@ -93,7 +94,7 @@ static ssize_t sys_store_sample_rate(struct device* dev,
 
 static DEVICE_ATTR(sample_rate, S_IWUSR, NULL, sys_store_sample_rate);
 
-static int imu_probe(struct spi_device *spi) {
+static int mpu_probe(struct spi_device *spi) {
 
 	int status = 0;
 
@@ -106,11 +107,11 @@ static int imu_probe(struct spi_device *spi) {
 	mdelay(100);
 
 	//sleep mode off
-	status = write_reg(spi, MPUREG_PWR_MGMT_1, 0x00); //clear SLEEP bit
+	status = write_reg(spi, MPUREG_PWR_MGMT_1, 0x00);
 	mdelay(100);
 
 	//disable I2C
-	status = write_reg(spi, MPUREG_USER_CTRL, BIT_I2C_IF_DIS); //set bit I2C_IF_DIS to 1
+	status = write_reg(spi, MPUREG_USER_CTRL, BIT_I2C_IF_DIS);
 	mdelay(100);
 
 	// SAMPLE RATE
@@ -158,10 +159,11 @@ static int imu_probe(struct spi_device *spi) {
 	mdelay(200);
 
 	// INT CFG => Interrupt on Data Ready
-	write_reg(spi, MPUREG_INT_ENABLE, BIT_RAW_RDY_EN);    // INT: Raw data ready
+	write_reg(spi, MPUREG_INT_ENABLE, BIT_RAW_RDY_EN);
 	mdelay(100);
-	write_reg(spi, MPUREG_INT_PIN_CFG, BIT_INT_ANYRD_2CLEAR); // INT: Clear on any read
-	mdelay(300);
+
+	write_reg(spi, MPUREG_INT_PIN_CFG, BIT_INT_ANYRD_2CLEAR);
+	mdelay(100);
 
 	mpu_sample_thread = kthread_create(sample_mpu, spi, "mpu_sampling");
 
@@ -241,12 +243,12 @@ static ssize_t mpu_read(struct file *file, char __user *buf, size_t count, loff_
 	return ret ? ret : copied;
 }
 
-static ssize_t mpu_open(struct inode * inode, struct file * file_ptr) {
+static int mpu_open(struct inode * inode, struct file * file_ptr) {
 	printk("Opened mpu 6000\n");
 	return 0;
 }
 
-static ssize_t mpu_close(struct inode * inode, struct file * file_ptr) {
+static int mpu_close(struct inode * inode, struct file * file_ptr) {
 	printk("Closed mpu 6000\n");
 	return 0;
 }
@@ -257,14 +259,14 @@ static struct file_operations fops = {
 		.release = mpu_close
 };
 
-static struct spi_driver imu_driver = {
+static struct spi_driver mpu_driver = {
 		.driver = {
-				.name = "imu",
+				.name = "mpu6000",
 				.owner = THIS_MODULE,
-				.of_match_table = imu_of_match,
+				.of_match_table = mpu_of_match,
 		},
-		.probe = imu_probe,
-		.remove = imu_remove,
+		.probe = mpu_probe,
+		.remove = mpu_remove,
 };
 
 void set_sample_rate(struct spi_device *spi, uint16_t desired_sample_rate_hz) {
@@ -284,39 +286,39 @@ static int mpu_init(void) {
 
 	INIT_KFIFO(mpu_reports);
 
-	retval = spi_register_driver(&imu_driver);
+	retval = spi_register_driver(&mpu_driver);
 
 	if (retval < 0) {
 		printk(KERN_ERR "failed to register driver: error %d\n", retval);
 		return retval;
 	}
 
-	mpu_major = register_chrdev(0, "imu", &fops);
+	mpu_major = register_chrdev(0, "mpu6000", &fops);
 	if (mpu_major < 0) {
 		printk(KERN_ERR "failed to register device: error %d\n", mpu_major);
 		retval = mpu_major;
-		goto init_failed;
+		goto register_failed;
 	}
 
 	mpu_class = class_create(THIS_MODULE, CLASS_NAME);
 	if (IS_ERR(mpu_class)) {
 		printk(KERN_ERR "failed to register device class '%s'\n", CLASS_NAME);
 		retval = PTR_ERR(mpu_class);
-		goto init_failed;
+		goto register_failed;
 	}
 
 	mpu_device = device_create(mpu_class, NULL, MKDEV(mpu_major, 0), NULL, CLASS_NAME);
 	if (IS_ERR(mpu_device)) {
 		printk(KERN_ERR "failed to create device '%s'\n", CLASS_NAME);
 		retval = PTR_ERR(mpu_device);
-		goto init_failed;
+		goto register_failed;
 	}
 
 	return retval;
 
-	init_failed:
+	register_failed:
 
-	//spi_unregister_device(spi);
+	exit_mpu();
 
 	return retval;
 }
@@ -379,7 +381,7 @@ static int sample_mpu(void * data) {
 module_init(mpu_init);
 
 static void exit_mpu(void) {
-	spi_unregister_driver(&imu_driver);
+	spi_unregister_driver(&mpu_driver);
 }
 
 module_exit(exit_mpu);
@@ -387,4 +389,4 @@ module_exit(exit_mpu);
 MODULE_DESCRIPTION("Driver for MPU 6000");
 MODULE_AUTHOR("Jimmy Johnson");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("imu");
+MODULE_ALIAS("mpu6000");
