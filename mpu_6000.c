@@ -333,13 +333,13 @@ static int sample_mpu(void * data) {
 #pragma pack(push, 1)
 	struct mpu_report {
 		uint8_t		status;
-		int16_t		gyro_x;
-		int16_t		gyro_y;
-		int16_t		gyro_z;
-		int16_t		temp;
 		int16_t		accel_x;
 		int16_t		accel_y;
 		int16_t		accel_z;
+		int16_t		temp;
+		int16_t		gyro_x;
+		int16_t		gyro_y;
+		int16_t		gyro_z;
 	} mpu_raw_report = {0};
 #pragma pack(pop)
 
@@ -350,9 +350,7 @@ static int sample_mpu(void * data) {
 		// change this to be controlled by mpu interrupt
 		schedule_timeout (HZ/100);
 
-		// pull out old data to make room for new read
-		// if needed and throw it out
-
+		// pull out old data to make room for a new read if the fifo is full
 		if(kfifo_is_full(&mpu_reports)) {
 			result = kfifo_get(&mpu_reports, &mpu_report);
 		}
